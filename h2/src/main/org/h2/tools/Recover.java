@@ -5,16 +5,7 @@
  */
 package org.h2.tools;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.io.PrintWriter;
-import java.io.Reader;
-import java.io.SequenceInputStream;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -30,6 +21,7 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.zip.CRC32;
+import java.util.concurrent.ThreadLocalRandom;
 import org.h2.api.ErrorCode;
 import org.h2.api.JavaObjectSerializer;
 import org.h2.compress.CompressLZF;
@@ -71,12 +63,7 @@ import org.h2.util.StringUtils;
 import org.h2.util.TempFileDeleter;
 import org.h2.util.Tool;
 import org.h2.util.Utils;
-import org.h2.value.CompareMode;
-import org.h2.value.Value;
-import org.h2.value.ValueArray;
-import org.h2.value.ValueLob;
-import org.h2.value.ValueLobDb;
-import org.h2.value.ValueLong;
+import org.h2.value.*;
 
 /**
  * Helps recovering a corrupted database.
@@ -84,6 +71,7 @@ import org.h2.value.ValueLong;
  */
 public class Recover extends Tool implements DataHandler {
 
+    private String dir = ".";
     private String databaseName;
     private int storageId;
     private String storageName;
@@ -96,6 +84,7 @@ public class Recover extends Tool implements DataHandler {
     private HashMap<Integer, String> tableMap;
     private HashMap<String, String> columnTypeMap;
     private boolean remove;
+    private boolean bytesToBlob = false;
 
     private int pageSize;
     private FileStore store;
@@ -171,7 +160,6 @@ public class Recover extends Tool implements DataHandler {
      */
     @Override
     public void runTool(String... args) throws SQLException {
-        String dir = ".";
         String db = null;
         for (int i = 0; args != null && i < args.length; i++) {
             String arg = args[i];
@@ -188,6 +176,8 @@ public class Recover extends Tool implements DataHandler {
             } else if (arg.equals("-help") || arg.equals("-?")) {
                 showUsage();
                 return;
+            } else if ("-bytesToBlob".equals(arg)) {
+                bytesToBlob = true;
             } else {
                 showUsageAndThrowUnsupportedOption(arg);
             }
@@ -454,6 +444,24 @@ public class Recover extends Tool implements DataHandler {
                 builder.append('(').append(id).append(", ").append(precision).append(')');
                 return;
             }
+        } else if (v instanceof ValueBytes) {
+            ValueBytes bytes = (ValueBytes) v;
+            String base = dir + "/rdmp_" + bytes.getTableId();
+            new File(base).mkdirs();
+            String id = "" + column + '_' + System.currentTimeMillis() + '_' + Math.abs(ThreadLocalRandom.current().nextInt());
+            String fileName = base + "/dmp_" + id + ".bin";
+            long precision = bytes.getType().getPrecision();
+            // transform to blob
+            String columnType = "BLOB";
+            columnTypeMap.put(column, columnType);
+            builder.append("READ_BLOB").append("('").append(fileName).append("')");
+            try (OutputStream out = FileUtils.newOutputStream(fileName, false)) {
+                out.write(bytes.getBytes());
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
+
+            return;
         }
         v.getSQL(builder);
     }
@@ -1553,6 +1561,11 @@ public class Recover extends Tool implements DataHandler {
                 // create, but not referential integrity constraints and so on
                 // because they could fail on duplicate keys
                 String sql = m.getSQL();
+                if (bytesToBlob) {
+                    if (sql.indexOf("LONGVARBINARY") > 0) {
+                        sql = sql.replace("LONGVARBINARY", "BLOB");
+                    }
+                }
                 writer.println(sql + ";");
             }
         }
