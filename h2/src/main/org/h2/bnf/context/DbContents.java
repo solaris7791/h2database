@@ -133,9 +133,15 @@ public class DbContents {
         isFirebird = url.startsWith("jdbc:firebirdsql:");
         isMSSQLServer = url.startsWith("jdbc:sqlserver:");
         if (isH2) {
-            JdbcConnection.Settings settings = ((JdbcConnection) conn).getSettings();
-            databaseToUpper = settings.databaseToUpper;
-            databaseToLower = settings.databaseToLower;
+            if (conn instanceof JdbcConnection) {
+                JdbcConnection.Settings settings = ((JdbcConnection) conn).getSettings();
+                databaseToUpper = settings.databaseToUpper;
+                databaseToLower = settings.databaseToLower;
+            }
+            else {
+                databaseToUpper = false;
+                databaseToLower = true;
+            }
         }else if (isMySQL || isPostgreSQL) {
             databaseToUpper = false;
             databaseToLower = true;
