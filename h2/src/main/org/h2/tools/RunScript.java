@@ -17,7 +17,10 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Enumeration;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import org.h2.engine.Constants;
 import org.h2.engine.SysProperties;
@@ -182,10 +185,29 @@ public class RunScript extends Tool {
     }
 
     private void process(Connection conn, String fileName,
-            boolean continueOnError, Charset charset) throws SQLException,
+                         boolean continueOnError, Charset charset) throws SQLException,
             IOException {
-        InputStream in = FileUtils.newInputStream(fileName);
         String path = FileUtils.getParent(fileName);
+        if (fileName.endsWith(".zip")) {
+            ZipFile zf = new ZipFile(fileName);
+            Enumeration<? extends ZipEntry> entries = zf.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry ze = (ZipEntry)entries.nextElement();
+                if (ze.getName().endsWith(".sql")) {
+                    InputStream in = zf.getInputStream(ze);
+                    try {
+                        Reader reader = new InputStreamReader(in, charset);
+                        process(conn, continueOnError, path, reader, charset);
+                    } finally {
+                        IOUtils.closeSilently(in);
+                    }
+                }
+            }
+            zf.close();
+            return;
+        }
+
+        InputStream in = FileUtils.newInputStream(fileName);
         try {
             in = new BufferedInputStream(in, Constants.IO_BUFFER_SIZE);
             Reader reader = new InputStreamReader(in, charset);
@@ -196,7 +218,7 @@ public class RunScript extends Tool {
     }
 
     private void process(Connection conn, boolean continueOnError, String path,
-            Reader reader, Charset charset) throws SQLException, IOException {
+                         Reader reader, Charset charset) throws SQLException, IOException {
         Statement stat = conn.createStatement();
         ScriptReader r = new ScriptReader(reader);
         while (true) {
@@ -252,7 +274,7 @@ public class RunScript extends Tool {
                                     result = StringUtils.replaceAll(result, " ", "+");
                                     throw new SQLException(
                                             "Unexpected output for:\n" + sql.trim() +
-                                            "\nGot:\n" + result + "\nExpected:\n" + expected);
+                                                    "\nGot:\n" + result + "\nExpected:\n" + expected);
                                 }
                             }
 
@@ -272,7 +294,7 @@ public class RunScript extends Tool {
     }
 
     private static void processRunscript(String url, String user, String password,
-            String fileName, String options) throws SQLException {
+                                         String fileName, String options) throws SQLException {
         Connection conn = null;
         Statement stat = null;
         try {
@@ -299,7 +321,7 @@ public class RunScript extends Tool {
      *            occurs
      */
     public static void execute(String url, String user, String password,
-            String fileName, Charset charset, boolean continueOnError)
+                               String fileName, Charset charset, boolean continueOnError)
             throws SQLException {
         new RunScript().process(url, user, password, fileName, charset,
                 continueOnError);
@@ -317,8 +339,8 @@ public class RunScript extends Tool {
      *            occurs
      */
     void process(String url, String user, String password,
-            String fileName, Charset charset,
-            boolean continueOnError) throws SQLException {
+                 String fileName, Charset charset,
+                 boolean continueOnError) throws SQLException {
         try {
             org.h2.Driver.load();
             if (charset == null) {

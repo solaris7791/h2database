@@ -5,7 +5,17 @@
  */
 package org.h2.tools;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.Reader;
+import java.io.SequenceInputStream;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -20,8 +30,12 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.zip.CRC32;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.zip.CRC32;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipOutputStream;
+
 import org.h2.api.ErrorCode;
 import org.h2.api.JavaObjectSerializer;
 import org.h2.compress.CompressLZF;
@@ -54,6 +68,7 @@ import org.h2.store.FileLister;
 import org.h2.store.FileStore;
 import org.h2.store.FileStoreInputStream;
 import org.h2.store.LobStorageFrontend;
+import org.h2.store.fs.FilePath;
 import org.h2.store.fs.FileUtils;
 import org.h2.util.IOUtils;
 import org.h2.util.IntArray;
@@ -63,7 +78,13 @@ import org.h2.util.StringUtils;
 import org.h2.util.TempFileDeleter;
 import org.h2.util.Tool;
 import org.h2.util.Utils;
-import org.h2.value.*;
+import org.h2.value.CompareMode;
+import org.h2.value.Value;
+import org.h2.value.ValueArray;
+import org.h2.value.ValueBytes;
+import org.h2.value.ValueLob;
+import org.h2.value.ValueLobDb;
+import org.h2.value.ValueLong;
 
 /**
  * Helps recovering a corrupted database.
@@ -85,6 +106,10 @@ public class Recover extends Tool implements DataHandler {
     private HashMap<String, String> columnTypeMap;
     private boolean remove;
     private boolean bytesToBlob = false;
+    private boolean compress = false;
+    private ZipOutputStream zip = null;
+    private ZipOutputStream archZip = null;
+    private String archName = null;
 
     private int pageSize;
     private FileStore store;
@@ -178,6 +203,8 @@ public class Recover extends Tool implements DataHandler {
                 return;
             } else if ("-bytesToBlob".equals(arg)) {
                 bytesToBlob = true;
+            } else if ("-zip".equals(arg)) {
+                compress = true;
             } else {
                 showUsageAndThrowUnsupportedOption(arg);
             }
@@ -188,15 +215,19 @@ public class Recover extends Tool implements DataHandler {
     /**
      * INTERNAL
      */
-    public static Reader readClob(String fileName) throws IOException {
-        return new BufferedReader(new InputStreamReader(readBlob(fileName),
+  public static Reader readClob(Connection conn, String fileName) throws IOException {
+    return new BufferedReader(new InputStreamReader(readBlob(conn, fileName),
                 StandardCharsets.UTF_8));
     }
 
     /**
      * INTERNAL
      */
-    public static InputStream readBlob(String fileName) throws IOException {
+  public static InputStream readBlob(Connection conn, String fileName) throws IOException {
+        int idx = fileName.indexOf('!');
+        if (idx > 0) {
+            return new ZipEntryInputStream(new ZipFile(fileName.substring(0, idx)), fileName.substring(idx + 1));
+        }
         return new BufferedInputStream(FileUtils.newInputStream(fileName));
     }
 
@@ -336,7 +367,29 @@ public class Recover extends Tool implements DataHandler {
                 try (PrintWriter writer = getWriter(f + ".h2.db", ".sql")) {
                     dumpMVStoreFile(writer, fileName);
                 }
+                closeZipsIfExit();
             }
+        }
+    }
+
+    private void closeZipsIfExit() {
+        if (zip != null) {
+          try {
+              zip.close();
+          }
+          catch (IOException ex) {
+              ex.printStackTrace();
+          }
+          zip = null;
+        }
+        if (archZip != null) {
+            try {
+              archZip.close();
+            }
+            catch (IOException ex) {
+                ex.printStackTrace();
+            }
+            archZip = null;
         }
     }
 
@@ -345,6 +398,30 @@ public class Recover extends Tool implements DataHandler {
         String outputFile = fileName + suffix;
         trace("Created file: " + outputFile);
         try {
+            if (compress) {
+                if (zip == null) {
+                    FilePath base = FilePath.get(dir);
+                    int len = base.toRealPath().toString().length();
+                    fileName = base.toString() + fileName.substring(len);
+                    archName = fileName;
+                    zip = new ZipOutputStream(FileUtils.newOutputStream(fileName + ".zip", false));
+                }
+                String entryName = new File(outputFile).getName();
+                ZipEntry entry = new ZipEntry(entryName);
+                zip.putNextEntry(entry);
+                class PrintWriterNoClose extends PrintWriter {
+                    public PrintWriterNoClose(OutputStream out) {
+                        super(out);
+                    }
+
+                    @Override
+                    public void close() {
+                        flush();
+                    }
+                }
+                return new PrintWriterNoClose(zip);
+            }
+
             return new PrintWriter(IOUtils.getBufferedWriter(
                     FileUtils.newOutputStream(outputFile, false)));
         } catch (IOException e) {
@@ -445,22 +522,38 @@ public class Recover extends Tool implements DataHandler {
                 return;
             }
         } else if (v instanceof ValueBytes) {
-            ValueBytes bytes = (ValueBytes) v;
-            String base = dir + "/rdmp_" + bytes.getTableId();
-            new File(base).mkdirs();
-            String id = "" + column + '_' + System.currentTimeMillis() + '_' + Math.abs(ThreadLocalRandom.current().nextInt());
-            String fileName = base + "/dmp_" + id + ".bin";
-            long precision = bytes.getType().getPrecision();
-            // transform to blob
-            String columnType = "BLOB";
-            columnTypeMap.put(column, columnType);
-            builder.append("READ_BLOB").append("('").append(fileName).append("')");
-            try (OutputStream out = FileUtils.newOutputStream(fileName, false)) {
-                out.write(bytes.getBytes());
+            try {
+                ValueBytes bytes = (ValueBytes) v;
+
+                String columnType = "BLOB";
+                columnTypeMap.put(column, columnType);
+
+                String base = "rdmp_" + storageName;
+                String id = "" + System.currentTimeMillis() + '_' + Math.abs(ThreadLocalRandom.current().nextInt());
+                String fileName = base + "/dmp_" + id + ".bin";
+                if (archName != null) {
+                    String zfName = archName + ".rdmp.zip"; 
+                    if (archZip == null) {
+                      archZip = new ZipOutputStream(FileUtils.newOutputStream(zfName, false));
+                    }
+                    ZipEntry ze = new ZipEntry(fileName);
+                    archZip.putNextEntry(ze);
+                    archZip.write(bytes.getBytes());
+                    builder.append("READ_BLOB").append("('").append(zfName + '!' + fileName).append("')");
+                }
+                else {
+                    new File(dir, base).mkdirs();
+                    fileName = dir + '/' + fileName;
+                    // transform to blob
+                    builder.append("READ_BLOB").append("('").append(fileName).append("')");
+                    try (OutputStream out = FileUtils.newOutputStream(fileName, false)) {
+                        out.write(bytes.getBytes());
+                    }
+                }
+              
             } catch (Exception ex) {
                 ex.printStackTrace();
             }
-
             return;
         }
         v.getSQL(builder);
@@ -1573,7 +1666,7 @@ public class Recover extends Tool implements DataHandler {
         // must occur before copying data,
         // otherwise the lob storage may be overwritten
         boolean deleteLobs = false;
-        for (Map.Entry<Integer, String> entry : tableMap.entrySet()) {
+        for (Entry<Integer, String> entry : tableMap.entrySet()) {
             Integer objectId = entry.getKey();
             String name = entry.getValue();
             if (objectIdSet.contains(objectId)) {
@@ -1590,7 +1683,7 @@ public class Recover extends Tool implements DataHandler {
                 }
             }
         }
-        for (Map.Entry<Integer, String> entry : tableMap.entrySet()) {
+        for (Entry<Integer, String> entry : tableMap.entrySet()) {
             Integer objectId = entry.getKey();
             String name = entry.getValue();
             if (objectIdSet.contains(objectId)) {
@@ -1803,4 +1896,96 @@ public class Recover extends Tool implements DataHandler {
     public CompareMode getCompareMode() {
         return CompareMode.getInstance(null, 0);
     }
+
+  /**
+   * An input stream that closes the ZipFile after data was read
+   */
+  private static class ZipEntryInputStream extends InputStream {
+
+    private final ZipFile zf;
+    private final InputStream in;
+
+    public ZipEntryInputStream(ZipFile zipFile, String fileName) throws IOException {
+      zf = zipFile;
+      ZipEntry entry = zipFile.getEntry(fileName);
+      in = zipFile.getInputStream(entry);
+    }
+
+    @Override
+    public int hashCode() {
+      return in.hashCode();
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      return in.equals(obj);
+    }
+
+    @Override
+    public int read() throws IOException {
+      return in.read();
+    }
+
+    @Override
+    public int read(byte[] b) throws IOException {
+      return in.read(b);
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+      return in.read(b, off, len);
+    }
+
+    @Override
+    public String toString() {
+      return in.toString();
+    }
+
+    @Override
+    public byte[] readAllBytes() throws IOException {
+      return in.readAllBytes();
+    }
+
+    @Override
+    public byte[] readNBytes(int len) throws IOException {
+      return in.readNBytes(len);
+    }
+
+    @Override
+    public int readNBytes(byte[] b, int off, int len) throws IOException {
+      return in.readNBytes(b, off, len);
+    }
+
+    @Override
+    public long skip(long n) throws IOException {
+      return in.skip(n);
+    }
+
+    @Override
+    public int available() throws IOException {
+      return in.available();
+    }
+
+    @Override
+    public void close() throws IOException {
+      in.close();
+      zf.close();
+    }
+
+    @Override
+    public void mark(int readlimit) {
+      in.mark(readlimit);
+    }
+
+    @Override
+    public void reset() throws IOException {
+      in.reset();
+    }
+
+    @Override
+    public boolean markSupported() {
+      return in.markSupported();
+    }
+
+  }
 }
